@@ -1,0 +1,9 @@
+names:
+  0: crack
+  1: cut
+  2: normal
+  3: puncture
+path: d:/sihh2/SIH-TEAM-FRAG/backend/data/tire_damage
+test: test/images
+train: train/images
+val: valid/images

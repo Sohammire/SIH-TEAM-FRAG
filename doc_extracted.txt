@@ -1,0 +1,471 @@
+SIH1557 technical mechanism report
+Build-level design for mining-dumper tyre intelligence
+0. Design decision
+Build three explainable intelligence services around one event-driven tyre data model:
+Vision service: image → damage presence/type/location/severity.
+Risk service: telemetry + vision + history → Low/Medium/High failure risk with reasons.
+Hotspot service: GPS/IMU + damage/failure outcomes → exposure-normalized mine-road risk map.
+Do not train a claimed time-to-failure model for the hackathon. A failure-time model needs repeated observations linked to the same tyre and a defined event endpoint. Mining studies do provide precedents for proportional-hazard reliability modelling and useful-life prediction, but that does not create the required public longitudinal dataset for this prototype[1][2]. Use fuzzy risk as decision support, not as a calibrated probability of failure.
+Commercial systems already cover much of the monitoring perimeter: pressure/temperature, GPS, alerts, analytics, fleet integration and severity maps[3][4]. TOMS also covers inspection images, tyre work, rotations, end-of-life changes, TPMS integration and predictive analytics[5]. The defensible prototype contribution is therefore the transparent fusion mechanism and deployable interfaces, not a claim that each component is new.
+
+1. Canonical data model and system contract
+Every record must be traceable through:
+truck_id → tyre_id → fitment_id → wheel_position → timestamp.
+1.1 Core entities
+Truck
+  truck_id, model, payload_capacity_t, mine_id, status
+
+Tyre
+  tyre_id, manufacturer, model, size, rated_tkph, install_date,
+  initial_tread_mm, cost, status
+
+TyreFitment
+  fitment_id, tyre_id, truck_id, position, installed_at,
+  removed_at, installation_hours, removal_reason
+
+SensorReading
+  reading_id, timestamp, truck_id, tyre_id, position,
+  pressure_kpa, tyre_temp_c, ambient_temp_c, payload_t,
+  speed_kmh, gps_lat, gps_lon, imu_ax, imu_ay, imu_az,
+  gyro_x, gyro_y, gyro_z, source, quality_flag
+
+OperationWindow
+  window_id, start_time, end_time, truck_id, route_id,
+  distance_km, mean_payload_t, mean_speed_kmh, ambient_temp_c,
+  idle_seconds, loaded_seconds, empty_seconds
+
+TKPHRecord
+  timestamp, tyre_id, mean_tyre_load_t, awss_kmh, tkph,
+  rated_tkph, exceedance_ratio, exceedance_minutes, method_version
+
+DamageInspection
+  inspection_id, timestamp, tyre_id, truck_id, image_id,
+  damage_present, damage_type, location, severity,
+  confidence, model_version, reviewer_status
+
+ImpactEvent
+  event_id, timestamp, truck_id, tyre_id_or_null,
+  gps_lat, gps_lon, peak_accel_g, jerk, duration_ms,
+  event_type, severity, road_segment_id
+
+Maintenance
+  maintenance_id, tyre_id, timestamp, action, reason,
+  labour_cost, parts_cost, downtime_hours, tread_after_mm
+
+Failure
+  failure_id, tyre_id, timestamp, failure_mode, cause,
+  downtime_hours, replacement_cost, confirmed_by
+1.2 Time-series key
+Sensor rows are append-only. reading_id is unique, but the analytical key is (tyre_id, timestamp). If the TPMS sensor cannot identify a tyre directly, the gateway maps sensor serial number to fitment_id; never join only by truck because tyre position changes.
+1.3 Event envelope
+{
+  "event_type": "sensor_reading",
+  "schema_version": "1.0",
+  "timestamp_utc": "2026-08-15T10:15:20Z",
+  "truck_id": "DUMPER_07",
+  "tyre_id": "TYRE_07_RR_OUT",
+  "position": "rear_right_outer",
+  "payload": {"pressure_kpa": 735, "tyre_temp_c": 82},
+  "quality": {"source": "simulator", "confidence": 1.0}
+}
+The same envelope is used for real and synthetic data; source distinguishes simulator, sensor, manual_inspection, inferred, and operator_confirmed.
+
+2. Sensor and IIoT mechanism
+The practical architecture is:
+TPMS / IMU / GPS / payload-CAN → edge gateway → MQTT → backend API → time-series + relational DB → analytics → dashboard.
+Mining IIoT research emphasizes interoperability and the difficulty caused by fragmented vendors, communication, data-management and security infrastructure[6].
+2.1 Recommended prototype hardware
+Pressure/temperature: real TPMS sensor if available; otherwise a laptop/Raspberry Pi simulator. Internal sensors are preferable because the objective is actual chamber pressure and temperature; commercial mining systems use internal readings and integrate with fleet systems[3].
+IMU: MPU-6050/ICM-20948 for the demonstrator; sample at 50–100 Hz. A mine-vehicle study showed that a small number of robust accelerometer/gyroscope sensors can reconstruct stress signals and estimate accumulated damage, while speed influence remains an unresolved issue[7].
+GPS: smartphone GNSS or USB GNSS at 1–10 Hz. Use map matching only after the raw track is stored.
+Payload/speed: simulator initially; real deployment should read the dumper’s authorised CAN/J1939 or fleet API rather than splice into safety-critical controls.
+Edge: Raspberry Pi 5 or industrial PC for gateway; ESP32 only for low-rate sensor acquisition.
+Network: BLE/RS-485 locally, Wi-Fi in a controlled demo, 4G/5G for mine backhaul. Use LoRaWAN only for low-rate sparse data, not raw IMU streams.
+Protocol: MQTT with QoS 1, retained device configuration, local buffering and replay after link loss.
+2.2 MQTT topics
+mine/{mine_id}/truck/{truck_id}/tyre/{tyre_id}/telemetry
+mine/{mine_id}/truck/{truck_id}/imu
+mine/{mine_id}/truck/{truck_id}/gps
+mine/{mine_id}/tyre/{tyre_id}/inspection
+mine/{mine_id}/alerts
+2.3 Minimum edge processing
+At the edge: timestamp synchronization, unit conversion, range checks, missing-value flags, IMU filtering, impact-event extraction and local pressure-loss alarms. Send both raw summary and derived event; do not discard raw values needed for later audit.
+
+3. TKPH engine
+3.1 Standard mechanism
+TKPH is a workload/thermal proxy based on tyre load and average work-shift speed:
+
+where:
+ = mean load carried by one tyre in tonnes;
+ = average work-shift speed in km/h.
+For a simple axle model:
+
+Use the actual load distribution if the dumper exposes axle or wheel loads. If not, apply a documented axle distribution assumption and mark it as inferred.
+3.2 Rolling/dynamic TKPH
+For each rolling window of length :
+mean_payload = mean(payload[t-W:t])
+mean_speed_loaded = distance_loaded / loaded_time
+mean_tyre_load = load_distribution(mean_payload, truck_config)
+tkph_window = mean_tyre_load * mean_speed_loaded
+Do not average zero-speed samples into AWSS. Separate moving, loaded-moving, empty-moving and idle states. Store both:
+tkph_current: rolling 5–15-minute value;
+tkph_shift: shift/cycle summary;
+tkph_exceedance: cumulative time above rating.
+Define:
+
+and:
+
+The site literature reports increasing real-site TKPH with average speed and ambient temperature, and nonlinear behaviour with cycle length[8]. OTR thermal modelling also uses vertical load, hauling speed and ambient temperature[9].
+3.3 Decision use
+ratio < 0.80: normal workload.
+0.80–1.00: monitor.
+1.00–1.15: warning; inspect temperature trajectory.
+>1.15: high workload; recommend speed/load review.
+These thresholds are prototype defaults, not manufacturer limits. Replace them with the tyre maker’s rated/design TKPH and mine engineering rules.
+TKPH should influence risk indirectly: it raises the thermal-risk input and maintenance priority, but it should not override an actual sensor alarm. A commercial TPMS source explicitly presents actual chamber temperature as more correlated with belt temperature than TKPH alone[3].
+
+4. Temperature prediction mechanism
+4.1 Why not FE in the 36-hour build?
+The strongest mechanistic OTR work uses a rubber heat-generation formulation, heat conduction and boundary conditions within a finite-element thermal model[9]. It is useful for offline calibration, but needs tyre geometry, material parameters, heat-transfer coefficients and validation sensors. Use it as the scientific rationale, not the live prototype model.
+4.2 First-order thermal model
+Use one internal thermal state:
+
+Variables:
+: current predicted tyre temperature in °C;
+: mean tyre load, tonnes;
+: speed, km/h converted consistently in calibration;
+: pressure factor, e.g. , clipped to a safe range;
+: ambient temperature;
+: 1 during idling/cooling state, otherwise 0;
+: heat-generation coefficients;
+: cooling coefficient;
+: idle cooling adjustment;
+: sampling interval in hours or seconds consistently.
+A more stable implementation is:
+
+where  is a calibrated heat-generation rate.
+4.3 Calibration
+With real sensor data, fit  using ridge regression on temperature increments:
+
+Use the first 70% of chronological data for fitting and the final 30% for testing. Never randomly split time-series rows.
+4.4 Abnormal trajectory
+Compute:
+
+and a smoothed residual:
+
+Alert when one of the following occurs:
+actual temperature exceeds a hard engineering limit;
+temperature slope is too high for the current TKPH;
+residual remains positive for N consecutive readings;
+pressure is low and residual is high;
+the model predicts cooling but actual temperature continues rising.
+The residual is a model-disagreement signal, not proof of internal belt damage. It can also indicate sensor bias, changed tyre construction, wrong load distribution or missing road/speed features.
+
+5. Tyre wear mechanism
+5.1 What is feasible
+For the prototype, estimate a wear rate from two or more tread-depth observations:
+
+If distance is reliable, also calculate mm/1,000 km. Extrapolate only within the observed operating regime:
+
+Label this wear_projection, not validated RUL.
+5.2 Feature pipeline
+inspection tread depth + tyre hours + position + payload + speed
++ TKPH + temperature excursions + pressure history + road score
+→ aggregate by tyre and time window
+→ calculate wear rate
+→ regression/gradient boosting baseline
+→ wear-rate band and projection
+Use robust linear regression first. If at least 30–50 tyre-level labelled histories exist, compare gradient boosting. Use tyre ID as a grouped split to prevent leakage.
+5.3 Why not ANFIS/RUL now?
+Survival analysis can model time to an observed removal/failure event, but requires censoring information and longitudinal event histories. A mining study used proportional hazards and found ambient temperature affected reliability and mean residual life[1]. A recent mining tyre study reported strong tread-depth influence and a GRNN–firefly hybrid model, but its reported performance is site-specific and does not substitute for cross-site validation[2]. Use those as future benchmarks, not as a reason to deploy a black-box model without data.
+
+6. Computer vision: image → damage/type/location/severity
+6.1 Model comparison
+Public image evidence is mostly passenger-car/bike domain. TyreNet contains 1,698 images, with 866 defective and 832 good images, collected at service stations and licensed CC BY 4.0[10]. A public project uses Mask R-CNN and separate models for defect, sidewall, tread and wear, but it is not evidence of mining-tyre generalisation[11]. Mining-specific work describes fender-mounted continuous imaging and hazards such as embedded objects, but the retrieved summary provides limited reproducible benchmark detail[12].
+6.2 Chosen mechanism
+Use YOLO transfer learning for detection plus a small severity classifier.
+image
+→ crop/resize/normalise
+→ quality check (blur, darkness, tyre visible)
+→ YOLO: damage box + class + location
+→ ROI crop
+→ severity classifier/rule layer
+→ inspection record + confidence + recommendation
+Classes:
+damage_type = cut | crack | puncture | embedded_object | tear | abrasion | unknown
+location = tread | shoulder | sidewall | bead | unknown
+severity = minor | moderate | severe
+If the existing images only say normal versus damaged, do not invent type/severity labels. Train the binary model and create staged, manually labelled images for the additional taxonomy.
+6.3 Severity without cut-depth measurement
+Use ordinal visual features:
+Minor: small localised discontinuity; no visible structural exposure; no obvious deformation; no pressure loss.
+Moderate: longer/deeper-looking crack or cut, repeated branching, visible embedded object, shoulder/sidewall involvement, or persistent defect across inspections.
+Severe: large open tear, exposed reinforcement, bead damage, major sidewall deformation, rapidly increasing area, or damage accompanied by pressure loss/thermal abnormality.
+These are operational labels, not millimetres. Start with a human-defined rubric and have two reviewers label a calibration set. For the demo, combine model confidence with image-derived features such as box area fraction, elongation, edge length, contrast, location and repeated detection. Do not claim structural depth or failure probability from RGB alone.
+
+7. Fuzzy failure-risk engine
+7.1 Why Mamdani is the correct prototype choice
+Use a small Mamdani fuzzy inference system rather than ANFIS. A Mamdani system works with expert rules, is transparent, does not require failure labels, and supports explanations. ANFIS learns membership/rule parameters from labelled outcomes; without real tyre failures it will overfit synthetic labels and create false precision. Fuzzy predictive-maintenance studies show the general pattern: historical/knowledge-based inputs are mapped to linguistic variables and defuzzified into failure likelihood[13].
+7.2 Inputs
+Keep the first version to six risk dimensions:
+thermal_stress: temperature level + temperature slope + positive residual;
+pressure_stress: pressure deviation + loss rate;
+tkph_stress: current TKPH/rated TKPH + exceedance minutes;
+damage_stress: severity and location;
+wear_stress: wear projection / tread remaining;
+impact_stress: recent exposure-normalized impact burden.
+Payload, speed, tyre age and operating history enter through these features. This avoids an unmanageable 10-input rule base.
+7.3 Membership functions
+Normalize each variable to 0–100 or 0–1. Use triangular/trapezoidal functions:
+pressure_stress: normal (0–25), low (15–60), critical (50–100)
+thermal_stress: normal (0–30), elevated (20–70), critical (60–100)
+tkph_stress: normal (0–40), high (30–80), excessive (70–100)
+damage_stress: none (0), minor (10–35), moderate (30–70), severe (65–100)
+wear_stress: low (0–40), medium (30–75), high (65–100)
+impact_stress: low (0–35), medium (25–70), high (60–100)
+output risk: low (0–35), medium (25–70), high (60–100)
+7.4 Rules
+Use monotonic safety rules, for example:
+IF pressure_stress is critical THEN risk is high
+IF thermal_stress is critical THEN risk is high
+IF damage_stress is severe THEN risk is high
+IF damage_stress is moderate AND pressure_stress is elevated THEN risk is high
+IF tkph_stress is excessive AND thermal_stress is elevated THEN risk is high
+IF wear_stress is high AND thermal_stress is elevated THEN risk is high
+IF impact_stress is high AND damage_stress is moderate THEN risk is high
+IF two or more of {thermal, pressure, TKPH} are elevated THEN risk is medium/high
+IF all stresses are normal AND no damage THEN risk is low
+7.5 Inference and explanation
+Fuzzification: convert numeric values to membership degrees.
+Rule firing: calculate AND as minimum or product.
+Aggregation: take maximum contribution for each output class.
+Defuzzification: centroid of aggregated output membership function.
+Decision: score 0–100 plus label.
+Explanation: return the top three firing rules and raw values.
+{
+  "risk_score": 82,
+  "risk_label": "HIGH",
+  "reasons": [
+    "TKPH is 1.18 times the rated value",
+    "temperature is rising despite reduced speed",
+    "moderate sidewall cut plus pressure loss"
+  ],
+  "recommended_action": "stop-and-inspect before next loaded cycle"
+}
+The score is not a calibrated probability unless validated against confirmed failures. The dashboard must display risk_score, risk_label, reasons, and data_quality separately.
+
+8. Geographical damage-hotspot engine
+8.1 Event detection
+From IMU:
+remove gravity using orientation estimate or high-pass filtering;
+calculate resultant acceleration;
+detect peaks above threshold with refractory period;
+calculate peak g, jerk, duration and speed;
+attach nearest GPS point;
+assign event to road segment.
+A mine-vehicle study used accelerometer/gyroscope data, coherence/LASSO signal selection, ARX stress estimation and rainflow damage accumulation; it also used accumulated damage to estimate road condition, while noting speed effects still needed work[7].
+8.2 Map matching
+For the hackathon, create a mine-road GeoJSON with segment IDs. Map each event to the nearest segment within a tolerance. Store both raw coordinates and assigned segment.
+8.3 Exposure-normalized scoring
+Raw event counts are biased toward heavily travelled roads. For segment :
+
+
+
+Use truck-km as the primary denominator because it measures exposure. Use events/trip as a secondary view when distance is unreliable. Use empirical-Bayes shrinkage or a minimum exposure threshold so one event on a rarely travelled segment does not become the top hotspot.
+A defensible composite is:
+
+where  values are standardized within the mine. If confirmed damage/failure labels are sparse, show separate layers instead of pretending they are equally reliable.
+8.4 Distinguish hotspot types
+Impact hotspot: high exposure-normalized IMU event rate; no damage outcome required.
+Damage hotspot: high confirmed image/inspection damage rate per truck-km.
+Failure hotspot: high confirmed removal/failure rate per truck-km.
+A road can be an impact hotspot but not a failure hotspot. A thermal tyre hotspot is different: it is a tyre-state event, not a geographic cluster.
+8.5 Algorithms
+Start with road-segment scoring. Add DBSCAN only to discover unsegmented clusters. KDE is useful for smooth visual density but still needs exposure correction. Getis-Ord Gi* and spatial autocorrelation are future additions requiring enough events and stable spatial units. Transport hotspot research similarly shows that exposure-normalized/distribution-aware methods outperform frequency-only baselines[14].
+
+9. End-to-end pipeline
+raw sensor/image data
+  → validate units, timestamps, IDs, quality
+  → store immutable raw events
+  → create 1-second/10-second telemetry windows
+  → calculate load, speed, pressure-loss and temperature trends
+  → calculate current/shift TKPH and exceedance
+  → predict temperature and residual
+  → calculate wear rate from tread observations
+  → run image detector and severity layer
+  → detect/map IMU impact events
+  → aggregate exposure-normalized hotspot metrics
+  → execute fuzzy risk rules
+  → rank maintenance priority
+  → serve API and dashboard/mobile views
+9.1 Maintenance priority
+Use:
+
+where criticality reflects wheel position/vehicle mission and data_confidence discounts missing, stale or simulated data. A severe image with high confidence and pressure loss should outrank a weak TKPH-only warning.
+Suggested actions:
+HIGH + pressure loss or severe damage → stop/inspect immediately
+HIGH thermal only → reduce load/speed and inspect temperature system
+MEDIUM → inspect at next maintenance window
+LOW → continue monitoring
+
+10. Chosen methods table
+
+11. Recommended 36-hour stack
+Backend
+Python 3.11
+FastAPI for typed REST endpoints
+Pydantic for event validation
+PostgreSQL + TimescaleDB if hosted; SQLite for local fallback
+SQLAlchemy for schema and queries
+Pandas/NumPy for feature windows
+scikit-learn for regression and baseline models
+scikit-fuzzy for Mamdani inference
+Vision
+Ultralytics YOLO for transfer learning/inference
+OpenCV for preprocessing and image quality checks
+Pillow for file handling
+Label Studio or Roboflow for rapid annotation
+Frontend and map
+Streamlit: fastest hackathon dashboard
+Plotly: trend plots and risk explanations
+Folium/pydeck: mine-road heatmap and segment ranking
+Deployment
+Docker Compose: backend, database, MQTT broker and dashboard
+Mosquitto MQTT broker
+Local laptop/Raspberry Pi demo first; cloud only if required
+The stack is chosen for integration speed and explainability. Do not add Kafka, Kubernetes, a feature store, a digital twin platform or a transformer model in the 36-hour build.
+
+12. Dataset specification
+12.1 Real data that can support a demo
+12.2 Synthetic data required now
+telemetry.csv:
+ timestamp, truck_id, tyre_id, position, payload_t, speed_kmh,
+ ambient_temp_c, pressure_kpa, tyre_temp_c, lat, lon,
+ ax_g, ay_g, az_g, tread_mm, source
+
+inspection.csv:
+ image_id, tyre_id, timestamp, damage_present,
+ damage_type, location, severity, reviewer_label, source
+
+failure.csv:
+ tyre_id, timestamp, failure_mode, confirmed, source
+Generate scenarios, not random noise:
+normal loaded cycle;
+gradual pressure leak;
+high payload/high speed/TKPH exceedance;
+hot ambient and slow cooling;
+impact cluster on one road segment;
+moderate sidewall cut followed by pressure loss;
+worn tyre with rising wear rate;
+sensor dropout and outlier.
+The simulator must inject ground-truth scenario_id so every output can be tested.
+12.3 Data required from CIL for real deployment
+truck and tyre master data;
+tyre sensor serial-to-position mapping;
+pressure/temperature at known sampling rate;
+payload and axle distribution;
+speed, distance, loaded/empty/idle state;
+ambient temperature and weather;
+GPS and IMU;
+tread measurements with timestamp and method;
+image inspection records with consistent camera geometry;
+tyre removal/failure date and confirmed cause;
+maintenance, rotation, repair and cost records;
+route/road-segment geometry and truck-km exposure.
+No public source retrieved here establishes a row-level, mining-specific dataset containing all these fields, tyre IDs and failure outcomes. Treat such data as a deployment prerequisite, not a hidden assumption.
+
+13. Module interfaces for three parallel developers
+Developer A — telemetry and analytics
+Owns: simulator, MQTT, ingestion, database, TKPH, temperature, wear.
+TelemetryWindow = {
+  "tyre_id": str,
+  "window_start": datetime,
+  "window_end": datetime,
+  "mean_payload_t": float,
+  "mean_speed_kmh": float,
+  "mean_pressure_kpa": float,
+  "mean_temp_c": float,
+  "ambient_temp_c": float,
+  "distance_km": float
+}
+
+DerivedTelemetry = {
+  "tyre_id": str,
+  "tkph_current": float,
+  "tkph_rated": float,
+  "tkph_exceedance_ratio": float,
+  "pressure_loss_kpa_per_h": float,
+  "temp_slope_c_per_h": float,
+  "temp_pred_c": float,
+  "temp_residual_c": float,
+  "wear_rate_mm_per_h": float | None
+}
+Tests: unit-test TKPH with hand calculations; simulate known heat input and verify temperature rises/cools; test tyre ID joins and missing data.
+Developer B — vision
+Owns: image ingestion, labels, training/inference, inspection API.
+DamageResult = {
+  "image_id": str,
+  "tyre_id": str | None,
+  "damage_present": bool,
+  "damage_type": str,
+  "location": str,
+  "severity": str,
+  "confidence": float,
+  "bbox": [float, float, float, float] | None,
+  "model_version": str,
+  "source": str
+}
+Tests: normal images should not create damage alerts; staged severe images should produce severe; low-light/blurred images should return quality_warning rather than confident classification.
+Developer C — geospatial, fuzzy risk and UI
+Owns: IMU events, map matching, segment scoring, fuzzy rules, maintenance priority, dashboard.
+HotspotResult = {
+  "road_segment_id": str,
+  "truck_km": float,
+  "impact_events": int,
+  "damage_events": int,
+  "failure_events": int,
+  "impact_rate_per_100_truck_km": float,
+  "damage_rate_per_100_truck_km": float,
+  "failure_rate_per_100_truck_km": float,
+  "hotspot_score": float,
+  "hotspot_type": str
+}
+
+RiskResult = {
+  "tyre_id": str,
+  "timestamp": datetime,
+  "risk_score": float,
+  "risk_label": str,
+  "reasons": list[str],
+  "recommended_action": str,
+  "data_confidence": float
+}
+Tests: one simulated impact route must create one expected hotspot; doubling truck traffic without new events must lower the normalized rate; a severe cut plus pressure loss must produce High risk; all-normal input must produce Low risk.
+Integration rule
+Each service reads/writes versioned JSON schemas through REST or a shared database. No service imports another developer’s internal Python modules. Integration happens only through:
+POST /telemetry
+POST /inspections
+POST /impact-events
+GET  /tyres/{tyre_id}/risk
+GET  /trucks/{truck_id}/live
+GET  /hotspots?start=&end=
+GET  /maintenance/priorities
+
+14. Hour-by-hour build plan
+Final implementation choice
+The build should use: rolling TKPH + first-order temperature state model + robust wear-rate regression + YOLO transfer learning with ordinal severity + road-segment hotspot rates normalized by truck-km + Mamdani fuzzy risk. This combination is simpler than FE thermal simulation, deep survival models, ANFIS or vision transformers, but preserves the mechanisms that matter: workload, thermal state, pressure, visible damage, cumulative wear, impact exposure and tyre history. The product’s strongest scientific claim should be that it provides explainable, multimodal maintenance prioritization; its weakest claims—validated failure probability, precise cut depth and time-to-failure—should remain future research until CIL supplies longitudinal tyre-level outcomes.
+References
+1. 	Rahimdel MJ (2022) Residual lifetime estimation for the mining truck tires. Proceedings of the Institution of mechanical engineers Part D, journal of automobile engineering. https://doi.org/10.1177/09544070221121855
+2. 	Kunkyin-Saadaari F, Kesseh A, Agadzie VK (2025) GRNN-FA hybrid model for predicting the useful life of dump truck tyres. Journal of Sustainable Mining. https://doi.org/10.46873/2300-3960.1451
+3. 	TyreSense - Industrial Tire Pressure Monitoring System (TPMS) - Rimex. https://www.rimex.com/tyresense/
+4. 	MICHELIN MEMS4: Premium mining TMPS solution. https://pro.africa.michelin.com/en/services/michelin-mems4
+5. 	TOMS: A Proactive Tire Management System - Kal Tire Mining Tire Group. https://www.kaltiremining.com/en/tire-management-services/toms/
+6. 	Aziz A, Schelén O, Bodin U (2020) A Study on Industrial IoT for the Mining Industry: Synthesized Architecture and Open Research Directions. IoT. https://doi.org/10.3390/iot1020029
+7. 	Jakobsson E, Frisk E, Pettersson R, Krysander M (2017) Data driven modeling and estimation of accumulated damage in mining vehicles using on-board sensors. Annual Conference of the PHM Society. https://doi.org/10.36001/phmconf.2017.v9i1.2309
+8. 	Ma S, Fan C, Liu W (2023) Effects of site operating conditions on real site TKPH (tonne-kilometer-per-hour) of ultra-large off-the-road tires. Proceedings of the Institution of mechanical engineers Part D, journal of automobile engineering. https://doi.org/10.1177/09544070231166166
+9. 	Ma S, Wu L, Liu W (2022) Numerical investigation of temperatures in ultra-large off-the-road tires under operating conditions at mine sites. Journal of Thermal Science and Engineering Apllications. https://doi.org/10.1115/1.4056086
+10. 	TyreNet: A High-quality Annotated Dataset for Tyre Defect ... https://data.mendeley.com/datasets/32b5vfj6tc
+11. 	smu-ivpl/TireDamageDetection. https://github.com/smu-ivpl/TireDamageDetection
+12. 	Silva GJF, Solorzano LFC, Suarez JT (2025) Real-Time Non-Intrusive Monitoring of Wear and Damage on Mining Truck Tires Using Digital Image Processing. International Journal of Electronics and Communication Engineering. https://doi.org/10.14445/23488549/ijece-v12i3p113
+13. 	Camacho KSI, Roque MLP, Vicerra RRP, Bugtai NT (2025) Predictive Maintenance Algorithm for Machine Failure Using Fuzzy Logic Techniques. Proceedings of International Exchange and Innovation Conference on Engineering &amp; Sciences (IEICES). https://doi.org/10.5109/7395694
+14. 	Qu W, Liu S, Zhao Q, Qi Y (2020) Methods for Identifying Truck Crash Hotspots. Journal of Advanced Transportation. https://doi.org/10.1155/2020/1751350
