@@ -1,0 +1,9 @@
+# Exclude heavy training datasets, runs, and git files from Vercel function bundle
+backend/data/
+backend/runs/
+.git/
+.github/
+node_modules/
+frontend/src/
+frontend/public/
+tests/

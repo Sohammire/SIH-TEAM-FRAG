@@ -1,7 +1,14 @@
-fastapi>=0.100.0
-uvicorn[standard]>=0.22.0
-pydantic>=2.0.0
-sqlalchemy>=2.0.0
-python-dotenv>=1.0.0
-pytest>=7.0.0
-httpx>=0.24.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+fastapi==0.110.0
+uvicorn==0.28.0
+pydantic==2.6.4
+sqlalchemy==2.0.28
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+pillow==10.2.0
+scikit-learn==1.4.1.post1
+scikit-fuzzy==0.4.2
+requests==2.31.0
+ultralytics==8.1.24
