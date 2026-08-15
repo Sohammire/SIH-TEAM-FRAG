@@ -61,8 +61,8 @@ export const ALERT_TYPES = {
 };
 
 // ─── API Config ─────────────────────────────────────────────────
-export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
-export const USE_MOCK_DATA = import.meta.env.VITE_USE_MOCK !== 'false';
+export const API_BASE_URL = import.meta.env.VITE_API_URL || '/api/v1';
+export const USE_MOCK_DATA = import.meta.env.VITE_USE_MOCK === 'true';
 
 // ─── Chart Colors ───────────────────────────────────────────────
 export const CHART_COLORS = {
